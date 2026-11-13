@@ -12,6 +12,10 @@ import org.bukkit.World;
 import org.bukkit.advancement.Advancement;
 import org.bukkit.advancement.AdvancementProgress;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
+import org.bukkit.block.BlockState;
+import org.bukkit.block.data.type.EndPortalFrame;
+import org.bukkit.boss.DragonBattle;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.PluginCommand;
@@ -34,6 +38,7 @@ import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.event.world.PortalCreateEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.CompassMeta;
@@ -84,6 +89,15 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     private final Set<UUID> frozen = new HashSet<>();
     private BukkitTask countdownTask;
     private BukkitTask breakTask;
+
+    /** portal blocks created during the game ("worldUID;x;y;z"), so they can be removed again */
+    private final Set<String> netherPortalBlocks = new HashSet<>();
+    /** end portal frames that got an eye from a player */
+    private final Set<String> eyeFrames = new HashSet<>();
+    /** the dragon was killed and should come back when someone enters the End */
+    private boolean dragonRespawnPending = false;
+    private static final BlockFace[] FACES = {
+            BlockFace.UP, BlockFace.DOWN, BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST};
 
     /** win stats, saved in data.yml */
     private int runnerWins = 0;
@@ -138,6 +152,9 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         y.set("roundStart", roundStart);
         y.set("stats.runnerWins", runnerWins);
         y.set("stats.hunterWins", hunterWins);
+        y.set("portals.nether", new ArrayList<>(netherPortalBlocks));
+        y.set("portals.frames", new ArrayList<>(eyeFrames));
+        y.set("dragonPending", dragonRespawnPending);
         for (Map.Entry<UUID, Location> en : lastKnown.entrySet()) {
             Location l = en.getValue();
             String base = "lastKnown." + en.getKey();
@@ -179,6 +196,9 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         roundStart = y.getLong("roundStart", System.currentTimeMillis());
         runnerWins = y.getInt("stats.runnerWins", 0);
         hunterWins = y.getInt("stats.hunterWins", 0);
+        netherPortalBlocks.addAll(y.getStringList("portals.nether"));
+        eyeFrames.addAll(y.getStringList("portals.frames"));
+        dragonRespawnPending = y.getBoolean("dragonPending", false);
 
         ConfigurationSection sec = y.getConfigurationSection("lastKnown");
         if (sec != null) {
@@ -434,7 +454,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     }
 
     private static final String MANHUNT_USAGE =
-            "§cUsage: /manhunt <start|random|remove <player>|stats|status|reset|compass>";
+            "§cUsage: /manhunt <start|random|remove <player>|stats|resetportals|status|reset|compass>";
 
     private boolean cmdManhunt(CommandSender sender, String[] args) {
         if (args.length < 1) {
@@ -453,6 +473,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                 sender.sendMessage("§6Round: §f" + (roundActive ? "running"
                         : breakTask != null ? "break (next round soon)" : "not started"));
                 sender.sendMessage("§6Score: §aRunner wins " + runnerWins + " §7| §cHunter wins " + hunterWins);
+                return true;
+            }
+            case "resetportals": {
+                sender.sendMessage("§a" + resetPortals());
                 return true;
             }
             case "stats": {
@@ -690,6 +714,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         Player next = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
         UUID previousId = runnerId;
 
+        if (getConfig().getBoolean("reset-portals", true)) {
+            resetPortals();
+        }
+
         // clean slate for everybody: inventory, advancements, health, ...
         for (Player p : players) {
             freshStart(p);
@@ -861,7 +889,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         if (cmd.getName().equalsIgnoreCase("manhunt")) {
             if (args.length == 1) {
                 String start = args[0].toLowerCase();
-                for (String sub : new String[]{"start", "random", "remove", "stats", "status", "reset", "compass"}) {
+                for (String sub : new String[]{"start", "random", "remove", "stats", "resetportals", "status", "reset", "compass"}) {
                     if (sub.startsWith(start)) out.add(sub);
                 }
             } else if (args.length == 2 && args[0].equalsIgnoreCase("stats")) {
@@ -954,12 +982,97 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         }
 
         if (runnerWon) {
-            // the dragon is dead for good, so the series ends here
-            resetAll();
-        } else {
-            // runner died: short break, then a new round with a new runner
-            saveData();
-            scheduleNextRound();
+            // the dragon comes back the next time someone enters the End
+            dragonRespawnPending = true;
+        }
+        // short break, then a new round with a new runner
+        saveData();
+        scheduleNextRound();
+    }
+
+    // ------------------------------------------------------------------ portals
+
+    private static String key(World w, int x, int y, int z) {
+        return w.getUID() + ";" + x + ";" + y + ";" + z;
+    }
+
+    private static Block blockFromKey(String k) {
+        String[] parts = k.split(";");
+        if (parts.length != 4) return null;
+        try {
+            World w = Bukkit.getWorld(UUID.fromString(parts[0]));
+            if (w == null) return null;
+            return w.getBlockAt(Integer.parseInt(parts[1]), Integer.parseInt(parts[2]), Integer.parseInt(parts[3]));
+        } catch (IllegalArgumentException ex) {
+            return null;
+        }
+    }
+
+    /**
+     * Removes the nether portals (+ their obsidian) made since the last reset and closes the stronghold
+     * portal frames players put eyes in. Only portals made while this plugin was running are known.
+     */
+    private String resetPortals() {
+        int netherBlocks = 0;
+        for (String k : new ArrayList<>(netherPortalBlocks)) {
+            Block b = blockFromKey(k);
+            if (b == null) continue;
+            Material t = b.getType();
+            if (t == Material.NETHER_PORTAL) {
+                for (BlockFace face : FACES) {
+                    Block neighbor = b.getRelative(face);
+                    if (neighbor.getType() == Material.OBSIDIAN) {
+                        neighbor.setType(Material.AIR, false);
+                    }
+                }
+                b.setType(Material.AIR, false);
+                netherBlocks++;
+            } else if (t == Material.OBSIDIAN) {
+                b.setType(Material.AIR, false);
+                netherBlocks++;
+            }
+        }
+        netherPortalBlocks.clear();
+
+        int frames = 0;
+        for (String k : new ArrayList<>(eyeFrames)) {
+            Block b = blockFromKey(k);
+            if (b == null) continue;
+            if (b.getBlockData() instanceof EndPortalFrame frame) {
+                frame.setEye(false);
+                b.setBlockData(frame, false);
+                frames++;
+            }
+            // close the portal itself (the 3x3 of end portal blocks inside the frames)
+            for (int dx = -4; dx <= 4; dx++) {
+                for (int dz = -4; dz <= 4; dz++) {
+                    Block pb = b.getRelative(dx, 0, dz);
+                    if (pb.getType() == Material.END_PORTAL) {
+                        pb.setType(Material.AIR, false);
+                    }
+                }
+            }
+        }
+        eyeFrames.clear();
+
+        saveData();
+        return "Portals reset: " + netherBlocks + " nether portal block(s) removed, "
+                + frames + " end portal frame(s) closed.";
+    }
+
+    /** Brings the dragon back (same as 4 crystals on the exit portal, but without needing them). */
+    private void respawnDragon(World end) {
+        if (!dragonRespawnPending) return;
+        DragonBattle battle = end.getEnderDragonBattle();
+        if (battle == null) return;
+        dragonRespawnPending = false;
+        saveData();
+        if (battle.getEnderDragon() != null) return; // already alive
+        try {
+            battle.initiateRespawn(new ArrayList<>());
+            Bukkit.broadcastMessage("§5§lThe Ender Dragon has returned!");
+        } catch (Throwable t) {
+            getLogger().warning("Could not respawn the Ender Dragon: " + t);
         }
     }
 
@@ -1014,6 +1127,40 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             // run next tick so we don't touch inventories in the middle of the death event
             Bukkit.getScheduler().runTask(this, () -> endRound(false, detail));
         }
+    }
+
+    /** Remember nether portals (lit by a player, or generated on the other side). */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPortalCreate(PortalCreateEvent e) {
+        PortalCreateEvent.CreateReason reason = e.getReason();
+        if (reason != PortalCreateEvent.CreateReason.FIRE && reason != PortalCreateEvent.CreateReason.NETHER_PAIR) return;
+        for (BlockState st : e.getBlocks()) {
+            netherPortalBlocks.add(key(st.getWorld(), st.getX(), st.getY(), st.getZ()));
+        }
+        saveData();
+    }
+
+    /** Remember which stronghold portal frames got an eye of ender. */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onEyePlace(PlayerInteractEvent e) {
+        if (e.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        Block b = e.getClickedBlock();
+        if (b == null || b.getType() != Material.END_PORTAL_FRAME) return;
+        ItemStack item = e.getItem();
+        if (item == null || item.getType() != Material.ENDER_EYE) return;
+        if (b.getBlockData() instanceof EndPortalFrame frame && !frame.hasEye()) {
+            eyeFrames.add(key(b.getWorld(), b.getX(), b.getY(), b.getZ()));
+            saveData();
+        }
+    }
+
+    /** First player in the End during a round brings the dragon back if it was killed earlier. */
+    @EventHandler
+    public void onEnterEnd(PlayerChangedWorldEvent e) {
+        if (!dragonRespawnPending || !roundActive) return;
+        World world = e.getPlayer().getWorld();
+        if (world.getEnvironment() != World.Environment.THE_END) return;
+        Bukkit.getScheduler().runTaskLater(this, () -> respawnDragon(world), 60L);
     }
 
     /** Frozen players can look around but not move. */
