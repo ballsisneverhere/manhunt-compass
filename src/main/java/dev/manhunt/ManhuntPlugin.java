@@ -578,25 +578,39 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             return true;
         }
 
-        World world = Bukkit.getWorlds().get(0);
-        Location center = world.getSpawnLocation().add(0.5, 0.0, 0.5);
-        gatherAndCountdown(runner, hs, world, center.getX(), center.getZ());
+        // the runner stays exactly where they are; the hunters come to them
+        gatherAndCountdown(runner, hs, runner.getLocation(), false);
         return true;
     }
 
-    /** Runner in the middle, hunters in a circle around them, everybody frozen, then the countdown runs. */
-    private void gatherAndCountdown(Player runner, List<Player> hs, World world, double cx, double cz) {
+    /**
+     * Hunters get teleported in a circle around the runner (facing them), everybody is frozen
+     * and the countdown runs. If moveRunner is true the runner is teleported to runnerSpot first,
+     * otherwise they stay where they are.
+     */
+    private void gatherAndCountdown(Player runner, List<Player> hs, Location runnerSpot, boolean moveRunner) {
         roundActive = false;
 
-        Location runnerSpot = groundAt(world, cx, cz);
-        teleportFrozen(runner, runnerSpot);
+        if (moveRunner) {
+            teleportFrozen(runner, runnerSpot);
+        } else {
+            frozen.add(runner.getUniqueId());
+        }
 
         int n = hs.size();
+        double[] radii = {CIRCLE_RADIUS, 3.0, 1.5}; // fall back to a tighter circle if the first one is inside rock
         for (int i = 0; i < n; i++) {
             double angle = 2.0 * Math.PI * i / n;
-            Location spot = groundAt(world,
-                    cx + CIRCLE_RADIUS * Math.cos(angle),
-                    cz + CIRCLE_RADIUS * Math.sin(angle));
+            Location spot = null;
+            for (double r : radii) {
+                spot = standableNear(runnerSpot,
+                        runnerSpot.getX() + r * Math.cos(angle),
+                        runnerSpot.getZ() + r * Math.sin(angle));
+                if (spot != null) break;
+            }
+            if (spot == null) {
+                spot = runnerSpot.clone();
+            }
             spot.setDirection(runnerSpot.toVector().subtract(spot.toVector())); // face the runner
             teleportFrozen(hs.get(i), spot);
         }
@@ -607,6 +621,34 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         Bukkit.broadcastMessage("§6§lMANHUNT §7starts in §f" + COUNTDOWN_SECONDS
                 + " §7seconds. Everyone is frozen until then!");
         startCountdown();
+    }
+
+    /**
+     * Finds a place to stand at x/z close to the height of "base" (works in caves, the Nether and the End,
+     * not just on the surface). Needs solid ground below and 2 free blocks above it. Returns null if none.
+     */
+    private static Location standableNear(Location base, double x, double z) {
+        World w = base.getWorld();
+        if (w == null) return null;
+        int bx = (int) Math.floor(x);
+        int bz = (int) Math.floor(z);
+        int baseY = base.getBlockY();
+
+        for (int d = 0; d <= 10; d++) {
+            int[] ys = d == 0 ? new int[]{baseY} : new int[]{baseY + d, baseY - d};
+            for (int y : ys) {
+                if (y <= w.getMinHeight() || y >= w.getMaxHeight() - 2) continue;
+                Block below = w.getBlockAt(bx, y - 1, bz);
+                Block feet = w.getBlockAt(bx, y, bz);
+                Block head = w.getBlockAt(bx, y + 1, bz);
+                if (below.getType().isSolid()
+                        && !feet.getType().isSolid() && !feet.isLiquid()
+                        && !head.getType().isSolid() && !head.isLiquid()) {
+                    return new Location(w, x, y, z);
+                }
+            }
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------ next round (after the runner died)
@@ -680,7 +722,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         // same world/seed, but a random place
         World world = Bukkit.getWorlds().get(0);
         Location spot = randomSafeCenter(world);
-        gatherAndCountdown(next, hs, world, spot.getX(), spot.getZ());
+        gatherAndCountdown(next, hs, spot, true);
         saveData();
     }
 
