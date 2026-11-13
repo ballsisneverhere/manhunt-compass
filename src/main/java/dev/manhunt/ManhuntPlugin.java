@@ -3,10 +3,15 @@ package dev.manhunt;
 import net.md_5.bungee.api.ChatMessageType;
 import net.md_5.bungee.api.chat.TextComponent;
 import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Tag;
 import org.bukkit.World;
+import org.bukkit.advancement.Advancement;
+import org.bukkit.advancement.AdvancementProgress;
+import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.PluginCommand;
@@ -33,6 +38,7 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.CompassMeta;
 import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.potion.PotionEffect;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
@@ -41,6 +47,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -76,6 +83,11 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     /** players who can't move during the start countdown */
     private final Set<UUID> frozen = new HashSet<>();
     private BukkitTask countdownTask;
+    private BukkitTask breakTask;
+
+    /** win stats, saved in data.yml */
+    private int runnerWins = 0;
+    private int hunterWins = 0;
     private File dataFile;
 
     private static final int COUNTDOWN_SECONDS = 5;
@@ -124,6 +136,8 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         y.set("hunters", ids);
         y.set("roundActive", roundActive);
         y.set("roundStart", roundStart);
+        y.set("stats.runnerWins", runnerWins);
+        y.set("stats.hunterWins", hunterWins);
         for (Map.Entry<UUID, Location> en : lastKnown.entrySet()) {
             Location l = en.getValue();
             String base = "lastKnown." + en.getKey();
@@ -163,6 +177,8 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
         roundActive = y.getBoolean("roundActive", false);
         roundStart = y.getLong("roundStart", System.currentTimeMillis());
+        runnerWins = y.getInt("stats.runnerWins", 0);
+        hunterWins = y.getInt("stats.hunterWins", 0);
 
         ConfigurationSection sec = y.getConfigurationSection("lastKnown");
         if (sec != null) {
@@ -418,7 +434,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     }
 
     private static final String MANHUNT_USAGE =
-            "§cUsage: /manhunt <start|random|remove <player>|status|reset|compass>";
+            "§cUsage: /manhunt <start|random|remove <player>|stats|status|reset|compass>";
 
     private boolean cmdManhunt(CommandSender sender, String[] args) {
         if (args.length < 1) {
@@ -434,7 +450,21 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                 }
                 sender.sendMessage("§6Speedrunner: §f" + (runnerId == null ? "none" : runnerName));
                 sender.sendMessage("§6Hunters: §f" + (names.isEmpty() ? "none" : String.join(", ", names)));
-                sender.sendMessage("§6Round: §f" + (roundActive ? "running" : "not started"));
+                sender.sendMessage("§6Round: §f" + (roundActive ? "running"
+                        : breakTask != null ? "break (next round soon)" : "not started"));
+                sender.sendMessage("§6Score: §aRunner wins " + runnerWins + " §7| §cHunter wins " + hunterWins);
+                return true;
+            }
+            case "stats": {
+                if (args.length >= 2 && args[1].equalsIgnoreCase("reset")) {
+                    runnerWins = 0;
+                    hunterWins = 0;
+                    saveData();
+                    sender.sendMessage("§aStats reset.");
+                    return true;
+                }
+                sender.sendMessage("§6Runner wins: §a" + runnerWins);
+                sender.sendMessage("§6Hunter wins: §c" + hunterWins);
                 return true;
             }
             case "reset": {
@@ -519,6 +549,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     // ------------------------------------------------------------------ /manhunt start
 
     private boolean cmdStart(CommandSender sender) {
+        if (breakTask != null) {
+            sender.sendMessage("§cThe next round is already scheduled.");
+            return true;
+        }
         if (countdownTask != null) {
             sender.sendMessage("§cA countdown is already running.");
             return true;
@@ -544,20 +578,25 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             return true;
         }
 
-        roundActive = false;
-
-        // runner in the middle of the world spawn, hunters in a circle around them
         World world = Bukkit.getWorlds().get(0);
         Location center = world.getSpawnLocation().add(0.5, 0.0, 0.5);
-        Location runnerSpot = groundAt(world, center.getX(), center.getZ());
+        gatherAndCountdown(runner, hs, world, center.getX(), center.getZ());
+        return true;
+    }
+
+    /** Runner in the middle, hunters in a circle around them, everybody frozen, then the countdown runs. */
+    private void gatherAndCountdown(Player runner, List<Player> hs, World world, double cx, double cz) {
+        roundActive = false;
+
+        Location runnerSpot = groundAt(world, cx, cz);
         teleportFrozen(runner, runnerSpot);
 
         int n = hs.size();
         for (int i = 0; i < n; i++) {
             double angle = 2.0 * Math.PI * i / n;
             Location spot = groundAt(world,
-                    center.getX() + CIRCLE_RADIUS * Math.cos(angle),
-                    center.getZ() + CIRCLE_RADIUS * Math.sin(angle));
+                    cx + CIRCLE_RADIUS * Math.cos(angle),
+                    cz + CIRCLE_RADIUS * Math.sin(angle));
             spot.setDirection(runnerSpot.toVector().subtract(spot.toVector())); // face the runner
             teleportFrozen(hs.get(i), spot);
         }
@@ -568,7 +607,159 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         Bukkit.broadcastMessage("§6§lMANHUNT §7starts in §f" + COUNTDOWN_SECONDS
                 + " §7seconds. Everyone is frozen until then!");
         startCountdown();
-        return true;
+    }
+
+    // ------------------------------------------------------------------ next round (after the runner died)
+
+    private void scheduleNextRound() {
+        int secs = Math.max(1, getConfig().getInt("break-seconds", 10));
+        Bukkit.broadcastMessage("§6Next round starts in §f" + secs + " §6seconds. A new speedrunner will be picked!");
+        breakTask = Bukkit.getScheduler().runTaskLater(this, this::startNextRound, secs * 20L);
+    }
+
+    private void startNextRound() {
+        breakTask = null;
+
+        Player oldRunner = getRunner();
+        List<Player> players = new ArrayList<>();
+        if (oldRunner != null) {
+            players.add(oldRunner);
+        }
+        for (UUID id : hunters) {
+            Player h = Bukkit.getPlayer(id);
+            if (h != null) {
+                players.add(h);
+            }
+        }
+        if (players.size() < 2) {
+            Bukkit.broadcastMessage("§cNot enough players online to continue. Manhunt stopped.");
+            resetAll();
+            return;
+        }
+
+        // next runner: random, but never the same person twice in a row.
+        // With only 2 players that simply means they take turns.
+        List<Player> candidates = new ArrayList<>();
+        for (Player p : players) {
+            if (!p.getUniqueId().equals(runnerId)) {
+                candidates.add(p);
+            }
+        }
+        Player next = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+        UUID previousId = runnerId;
+
+        // clean slate for everybody: inventory, advancements, health, ...
+        for (Player p : players) {
+            freshStart(p);
+        }
+
+        // swap roles (the old runner becomes a hunter)
+        becomeRunner(next);
+        if (previousId != null && !previousId.equals(next.getUniqueId())) {
+            Player previous = Bukkit.getPlayer(previousId);
+            if (previous != null) {
+                becomeHunter(previous);
+            } else {
+                hunters.add(previousId);
+            }
+        }
+
+        List<Player> hs = new ArrayList<>();
+        for (UUID id : hunters) {
+            Player h = Bukkit.getPlayer(id);
+            if (h != null) {
+                hs.add(h);
+            }
+        }
+
+        Bukkit.broadcastMessage("§6§lNEW ROUND §7- Speedrunner: §f" + next.getName());
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            p.sendTitle("§6New speedrunner", "§f" + next.getName(), 5, 50, 10);
+        }
+
+        // same world/seed, but a random place
+        World world = Bukkit.getWorlds().get(0);
+        Location spot = randomSafeCenter(world);
+        gatherAndCountdown(next, hs, world, spot.getX(), spot.getZ());
+        saveData();
+    }
+
+    /** Fresh start for a new round: empty inventory, no advancements, full health, survival mode. */
+    private void freshStart(Player p) {
+        if (p.isDead()) {
+            p.spigot().respawn();
+        }
+        if (getConfig().getBoolean("clear-inventory", true)) {
+            p.getInventory().clear();
+            p.getInventory().setArmorContents(new ItemStack[4]);
+            p.getInventory().setItemInOffHand(new ItemStack(Material.AIR));
+            p.getEnderChest().clear();
+        }
+        for (PotionEffect effect : new ArrayList<>(p.getActivePotionEffects())) {
+            p.removePotionEffect(effect.getType());
+        }
+        p.setGameMode(GameMode.SURVIVAL);
+        p.setHealth(p.getMaxHealth());
+        p.setFoodLevel(20);
+        p.setSaturation(20.0f);
+        p.setFireTicks(0);
+        p.setFallDistance(0f);
+        p.setExp(0f);
+        p.setLevel(0);
+        if (getConfig().getBoolean("reset-advancements", true)) {
+            resetAdvancements(p);
+        }
+    }
+
+    private void resetAdvancements(Player p) {
+        Iterator<Advancement> it = Bukkit.advancementIterator();
+        while (it.hasNext()) {
+            Advancement adv = it.next();
+            if (adv.getKey().getKey().startsWith("recipes/")) continue; // keep the recipe book
+            AdvancementProgress progress = p.getAdvancementProgress(adv);
+            for (String criteria : new ArrayList<>(progress.getAwardedCriteria())) {
+                progress.revokeCriteria(criteria);
+            }
+        }
+    }
+
+    /** Random dry-land spot in the same world (can't change the seed, so we go somewhere new instead). */
+    private Location randomSafeCenter(World world) {
+        int radius = Math.max(100, getConfig().getInt("random-tp-radius", 3000));
+        Location spawn = world.getSpawnLocation();
+        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+        for (int i = 0; i < 12; i++) {
+            int x = spawn.getBlockX() + rnd.nextInt(-radius, radius + 1);
+            int z = spawn.getBlockZ() + rnd.nextInt(-radius, radius + 1);
+            Block top = world.getHighestBlockAt(x, z);
+            if (isSafeGround(top)) {
+                return new Location(world, x + 0.5, top.getY() + 1, z + 0.5);
+            }
+        }
+        return groundAt(world, spawn.getX() + 0.5, spawn.getZ() + 0.5); // fallback: world spawn
+    }
+
+    private static boolean isSafeGround(Block b) {
+        Material t = b.getType();
+        if (b.isLiquid() || Tag.LEAVES.isTagged(t)) return false;
+        if (t == Material.MAGMA_BLOCK || t == Material.CACTUS || t == Material.FIRE) return false;
+        return t.isSolid() || t == Material.SNOW;
+    }
+
+    /** Hunter respawn break: frozen for a few seconds after dying. */
+    private void startRespawnBreak(Player p) {
+        int secs = Math.max(1, getConfig().getInt("break-seconds", 10));
+        UUID id = p.getUniqueId();
+        frozen.add(id);
+        p.sendTitle("§cRespawn break", "§7You can move in " + secs + " seconds", 5, 40, 10);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (frozen.remove(id)) {
+                Player q = Bukkit.getPlayer(id);
+                if (q != null) {
+                    q.sendTitle("§aGo!", "§7Find the speedrunner!", 0, 30, 10);
+                }
+            }
+        }, secs * 20L);
     }
 
     private static Location groundAt(World world, double x, double z) {
@@ -628,9 +819,11 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         if (cmd.getName().equalsIgnoreCase("manhunt")) {
             if (args.length == 1) {
                 String start = args[0].toLowerCase();
-                for (String sub : new String[]{"start", "random", "remove", "status", "reset", "compass"}) {
+                for (String sub : new String[]{"start", "random", "remove", "stats", "status", "reset", "compass"}) {
                     if (sub.startsWith(start)) out.add(sub);
                 }
+            } else if (args.length == 2 && args[0].equalsIgnoreCase("stats")) {
+                if ("reset".startsWith(args[1].toLowerCase())) out.add("reset");
             } else if (args.length == 2 && args[0].equalsIgnoreCase("remove")) {
                 String start = args[1].toLowerCase();
                 for (Player p : Bukkit.getOnlinePlayers()) {
@@ -651,6 +844,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     // ------------------------------------------------------------------ round handling
 
     private void resetAll() {
+        if (breakTask != null) {
+            breakTask.cancel();
+            breakTask = null;
+        }
         if (countdownTask != null) {
             countdownTask.cancel();
             countdownTask = null;
@@ -691,6 +888,11 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     private void endRound(boolean runnerWon, String detail) {
         if (!roundActive) return;
         roundActive = false;
+        if (runnerWon) {
+            runnerWins++;
+        } else {
+            hunterWins++;
+        }
 
         String time = formatElapsed(System.currentTimeMillis() - roundStart);
         String title = runnerWon ? "§a§lSPEEDRUNNER WINS!" : "§c§lHUNTERS WIN!";
@@ -700,6 +902,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         Bukkit.broadcastMessage(title);
         Bukkit.broadcastMessage(detail);
         Bukkit.broadcastMessage("§7Round time: §f" + time);
+        Bukkit.broadcastMessage("§7Score: §aRunner wins §f" + runnerWins + " §7| §cHunter wins §f" + hunterWins);
         Bukkit.broadcastMessage(line);
 
         String sound = runnerWon ? "ui.toast.challenge_complete" : "entity.ender_dragon.growl";
@@ -708,7 +911,14 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             p.playSound(p.getLocation(), sound, 1.0f, 1.0f);
         }
 
-        resetAll();
+        if (runnerWon) {
+            // the dragon is dead for good, so the series ends here
+            resetAll();
+        } else {
+            // runner died: short break, then a new round with a new runner
+            saveData();
+            scheduleNextRound();
+        }
     }
 
     // ------------------------------------------------------------------ events
@@ -811,6 +1021,9 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         Bukkit.getScheduler().runTaskLater(this, () -> {
             giveCompass(p);
             refresh(p, getRunner(), false);
+            if (roundActive) {
+                startRespawnBreak(p);
+            }
         }, 1L);
     }
 
