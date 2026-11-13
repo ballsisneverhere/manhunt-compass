@@ -11,12 +11,15 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.command.TabExecutor;
+import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
+import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -32,6 +35,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -53,6 +57,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     private final Set<UUID> hunters = new HashSet<>();
     private UUID runnerId;
     private String runnerName = "?";
+
+    /** true from /speedrunner until someone wins (or /manhunt reset) */
+    private boolean roundActive = false;
+    private long roundStart = 0L;
 
     /** world UID -> last known runner location in that world */
     private final Map<UUID, Location> lastKnown = new HashMap<>();
@@ -289,6 +297,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         lastKnown.clear();
         remember(target.getLocation());
 
+        roundActive = true;
+        roundStart = System.currentTimeMillis();
+        Bukkit.broadcastMessage("§6§lMANHUNT STARTED §7- Speedrunner: §f" + runnerName);
+
         sender.sendMessage("§a" + target.getName() + " is now the speedrunner.");
         target.sendMessage("§aYou are the SPEEDRUNNER! §7Hunters are tracking you.");
         for (UUID id : hunters) {
@@ -302,8 +314,13 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         return true;
     }
 
+    private static final String MANHUNT_USAGE = "§cUsage: /manhunt <status|reset|compass>";
+
     private boolean cmdManhunt(CommandSender sender, String[] args) {
-        if (args.length < 1) return false;
+        if (args.length < 1) {
+            sender.sendMessage(MANHUNT_USAGE);
+            return true;
+        }
         switch (args[0].toLowerCase()) {
             case "status": {
                 List<String> names = new ArrayList<>();
@@ -316,13 +333,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                 return true;
             }
             case "reset": {
-                hunters.clear();
-                runnerId = null;
-                runnerName = "?";
-                lastKnown.clear();
-                for (Player p : Bukkit.getOnlinePlayers()) {
-                    removeTrackers(p);
-                }
+                resetAll();
                 sender.sendMessage("§aManhunt reset. All tracker compasses removed.");
                 return true;
             }
@@ -340,26 +351,88 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                 return true;
             }
             default:
-                return false;
+                sender.sendMessage(MANHUNT_USAGE);
+                return true;
         }
     }
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command cmd, String alias, String[] args) {
         List<String> out = new ArrayList<>();
-        if (args.length != 1) return out;
-        String start = args[0].toLowerCase();
 
         if (cmd.getName().equalsIgnoreCase("manhunt")) {
-            for (String s : new String[]{"status", "reset", "compass"}) {
-                if (s.startsWith(start)) out.add(s);
+            if (args.length == 1) {
+                String start = args[0].toLowerCase();
+                for (String sub : new String[]{"status", "reset", "compass"}) {
+                    if (sub.startsWith(start)) out.add(sub);
+                }
             }
-        } else {
-            for (Player p : Bukkit.getOnlinePlayers()) {
-                if (p.getName().toLowerCase().startsWith(start)) out.add(p.getName());
-            }
+            return out;
+        }
+
+        if (args.length != 1) return out;
+        String prefix = args[0].toLowerCase();
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            if (p.getName().toLowerCase().startsWith(prefix)) out.add(p.getName());
         }
         return out;
+    }
+
+    // ------------------------------------------------------------------ round handling
+
+    private void resetAll() {
+        hunters.clear();
+        runnerId = null;
+        runnerName = "?";
+        lastKnown.clear();
+        roundActive = false;
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            removeTrackers(p);
+        }
+    }
+
+    private void notifyHunters(String message) {
+        for (UUID id : hunters) {
+            Player h = Bukkit.getPlayer(id);
+            if (h != null) {
+                h.sendMessage(message);
+            }
+        }
+    }
+
+    private static String formatElapsed(long ms) {
+        long total = Math.max(0L, ms / 1000L);
+        long h = total / 3600L;
+        long m = (total % 3600L) / 60L;
+        long sec = total % 60L;
+        if (h > 0) {
+            return String.format(Locale.ROOT, "%dh %02dm %02ds", h, m, sec);
+        }
+        return String.format(Locale.ROOT, "%dm %02ds", m, sec);
+    }
+
+    /** Announce the winner to everyone, then reset all roles + compasses. */
+    private void endRound(boolean runnerWon, String detail) {
+        if (!roundActive) return;
+        roundActive = false;
+
+        String time = formatElapsed(System.currentTimeMillis() - roundStart);
+        String title = runnerWon ? "§a§lSPEEDRUNNER WINS!" : "§c§lHUNTERS WIN!";
+        String line = "§8§m------------------------------";
+
+        Bukkit.broadcastMessage(line);
+        Bukkit.broadcastMessage(title);
+        Bukkit.broadcastMessage(detail);
+        Bukkit.broadcastMessage("§7Round time: §f" + time);
+        Bukkit.broadcastMessage(line);
+
+        String sound = runnerWon ? "ui.toast.challenge_complete" : "entity.ender_dragon.growl";
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            p.sendTitle(title, detail, 10, 100, 20);
+            p.playSound(p.getLocation(), sound, 1.0f, 1.0f);
+        }
+
+        resetAll();
     }
 
     // ------------------------------------------------------------------ events
@@ -378,6 +451,9 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     public void onQuit(PlayerQuitEvent e) {
         if (e.getPlayer().getUniqueId().equals(runnerId)) {
             remember(e.getPlayer().getLocation());
+            if (roundActive) {
+                notifyHunters("§6" + runnerName + " §cdisconnected. §7Compass stays on their last known spot.");
+            }
         }
     }
 
@@ -388,14 +464,43 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             giveCompass(p);
             refresh(p, getRunner(), false);
         }
+        if (roundActive && p.getUniqueId().equals(runnerId)) {
+            notifyHunters("§6" + runnerName + " §areconnected.");
+        }
     }
 
     /** Hunters keep their compass: don't drop it on death, re-give on respawn. */
     @EventHandler
     public void onDeath(PlayerDeathEvent e) {
-        if (hunters.contains(e.getEntity().getUniqueId())) {
+        Player dead = e.getEntity();
+        if (hunters.contains(dead.getUniqueId())) {
             e.getDrops().removeIf(this::isTracker);
         }
+        if (roundActive && dead.getUniqueId().equals(runnerId)) {
+            Player killer = dead.getKiller();
+            String detail = killer != null
+                    ? "§f" + dead.getName() + " §7was killed by §c" + killer.getName() + "§7!"
+                    : "§f" + dead.getName() + " §7died!";
+            // run next tick so we don't touch inventories in the middle of the death event
+            Bukkit.getScheduler().runTask(this, () -> endRound(false, detail));
+        }
+    }
+
+    /** Ender Dragon dies while a round is running = speedrunner wins. */
+    @EventHandler
+    public void onEntityDeath(EntityDeathEvent e) {
+        if (e.getEntityType() != EntityType.ENDER_DRAGON) return;
+        if (!roundActive || runnerId == null) return;
+        Bukkit.getScheduler().runTask(this, () ->
+                endRound(true, "§f" + runnerName + " §7defeated the Ender Dragon!"));
+    }
+
+    /** Tell hunters when the runner changes dimension. */
+    @EventHandler
+    public void onWorldChange(PlayerChangedWorldEvent e) {
+        Player p = e.getPlayer();
+        if (!roundActive || !p.getUniqueId().equals(runnerId)) return;
+        notifyHunters("§6" + runnerName + " §7entered the §c" + dimension(p.getWorld()) + "§7.");
     }
 
     @EventHandler
