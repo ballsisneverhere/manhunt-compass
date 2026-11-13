@@ -722,14 +722,19 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
     // ------------------------------------------------------------------ next round (after the runner died)
 
-    /** total time from the end of a round until the next one starts */
-    private int roundBreakTotal() {
-        return Math.max(2, getConfig().getInt("round-break-seconds", 30));
-    }
-
     /** seconds after the end of a round until everybody gets teleported */
     private int teleportDelay() {
-        return Math.min(Math.max(1, getConfig().getInt("teleport-delay-seconds", 5)), roundBreakTotal() - 1);
+        return Math.max(1, getConfig().getInt("teleport-delay-seconds", 5));
+    }
+
+    /** seconds everybody waits frozen at the new spot before the round starts */
+    private int freezeSeconds() {
+        return Math.max(1, getConfig().getInt("freeze-seconds", 50));
+    }
+
+    /** total time from the end of a round until the next one starts */
+    private int roundBreakTotal() {
+        return teleportDelay() + freezeSeconds();
     }
 
     private void scheduleNextRound() {
@@ -855,7 +860,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         World world = Bukkit.getWorlds().get(0);
         Location spot = nextSpot != null ? nextSpot : randomSafeCenter(world);
         nextSpot = null;
-        gatherAndCountdown(next, hs, spot, true, roundBreakTotal() - teleportDelay());
+        gatherAndCountdown(next, hs, spot, true, freezeSeconds());
         releasePreloadedChunks(); // players are there now, so the chunks stay loaded anyway
         saveData();
     }
