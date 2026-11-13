@@ -52,6 +52,7 @@ import org.bukkit.scheduler.BukkitTask;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -91,6 +92,12 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     private final Set<UUID> frozen = new HashSet<>();
     private BukkitTask countdownTask;
     private BukkitTask breakTask;
+
+    /** random spot for the next round, picked at the start of the break so its chunks can be loaded early */
+    private Location nextSpot;
+    private BukkitTask preloadTask;
+    private World ticketedWorld;
+    private final List<int[]> ticketedChunks = new ArrayList<>();
 
     /** portal blocks created during the game ("worldUID;x;y;z"), so they can be removed again */
     private final Set<String> netherPortalBlocks = new HashSet<>();
@@ -702,9 +709,58 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     // ------------------------------------------------------------------ next round (after the runner died)
 
     private void scheduleNextRound() {
-        int secs = Math.max(1, getConfig().getInt("break-seconds", 10));
-        Bukkit.broadcastMessage("§6Next round starts in §f" + secs + " §6seconds. A new speedrunner will be picked!");
+        int secs = Math.max(1, getConfig().getInt("round-break-seconds", 30));
+        Bukkit.broadcastMessage("§6Next round starts in §f" + secs
+                + " §6seconds. A new speedrunner will be picked and the next area is loading!");
         breakTask = Bukkit.getScheduler().runTaskLater(this, this::startNextRound, secs * 20L);
+        preloadNextSpot();
+    }
+
+    /** Picks the random spot now and loads the chunks around it a little at a time during the break. */
+    private void preloadNextSpot() {
+        releasePreloadedChunks();
+        World world = Bukkit.getWorlds().get(0);
+        nextSpot = randomSafeCenter(world);
+        ticketedWorld = world;
+
+        final int cx = nextSpot.getBlockX() >> 4;
+        final int cz = nextSpot.getBlockZ() >> 4;
+        final List<int[]> queue = new ArrayList<>();
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                queue.add(new int[]{cx + dx, cz + dz});
+            }
+        }
+        queue.sort(Comparator.comparingInt((int[] c) -> (c[0] - cx) * (c[0] - cx) + (c[1] - cz) * (c[1] - cz)));
+
+        final int[] index = {0};
+        preloadTask = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            if (index[0] >= queue.size()) {
+                if (preloadTask != null) {
+                    preloadTask.cancel();
+                    preloadTask = null;
+                }
+                return;
+            }
+            int[] c = queue.get(index[0]++);
+            world.addPluginChunkTicket(c[0], c[1], this); // keep it loaded until the round starts
+            ticketedChunks.add(c);
+            world.getChunkAt(c[0], c[1]);                 // loads / generates it
+        }, 20L, 4L);
+    }
+
+    private void releasePreloadedChunks() {
+        if (preloadTask != null) {
+            preloadTask.cancel();
+            preloadTask = null;
+        }
+        if (ticketedWorld != null) {
+            for (int[] c : ticketedChunks) {
+                ticketedWorld.removePluginChunkTicket(c[0], c[1], this);
+            }
+        }
+        ticketedChunks.clear();
+        ticketedWorld = null;
     }
 
     private void startNextRound() {
@@ -773,8 +829,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
         // same world/seed, but a random place
         World world = Bukkit.getWorlds().get(0);
-        Location spot = randomSafeCenter(world);
+        Location spot = nextSpot != null ? nextSpot : randomSafeCenter(world);
+        nextSpot = null;
         gatherAndCountdown(next, hs, spot, true);
+        releasePreloadedChunks(); // players are there now, so the chunks stay loaded anyway
         saveData();
     }
 
@@ -942,6 +1000,8 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             breakTask.cancel();
             breakTask = null;
         }
+        nextSpot = null;
+        releasePreloadedChunks();
         if (countdownTask != null) {
             countdownTask.cancel();
             countdownTask = null;
