@@ -1,0 +1,22 @@
+name: ManhuntCompass
+version: ${project.version}
+main: dev.manhunt.ManhuntPlugin
+api-version: '1.16'
+description: Manhunt tracking compass that works across dimensions and unloaded chunks.
+commands:
+  hunter:
+    description: Make a player a hunter and give them the tracking compass.
+    usage: /hunter <player>
+    permission: manhunt.admin
+  speedrunner:
+    description: Set the speedrunner that the hunters' compasses track.
+    usage: /speedrunner <player>
+    permission: manhunt.admin
+  manhunt:
+    description: Manhunt utilities (status, reset, compass).
+    usage: /manhunt <status|reset|compass>
+    permission: manhunt.admin
+permissions:
+  manhunt.admin:
+    description: Use the manhunt commands.
+    default: op
