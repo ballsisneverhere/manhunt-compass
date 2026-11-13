@@ -258,7 +258,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         if (target != null) {
             pointCompasses(hunter, target);
         }
-        if (actionBar && holdingTracker(hunter)) {
+        if (actionBar && holdingTracker(hunter) && !frozen.contains(hunter.getUniqueId())) {
             showInfo(hunter, runner, target);
         }
     }
@@ -633,8 +633,22 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             return true;
         }
 
+        // everybody who plays starts with an empty inventory (hunters get their compass back)
+        if (getConfig().getBoolean("clear-inventory", true)) {
+            clearInventory(runner);
+            runner.sendMessage("§7Your inventory was cleared.");
+            for (Player h : hs) {
+                clearInventory(h);
+                h.sendMessage("§7Your inventory was cleared.");
+            }
+        }
+        for (Player h : hs) {
+            giveCompass(h);
+            refresh(h, runner, false);
+        }
+
         // the runner stays exactly where they are; the hunters come to them
-        gatherAndCountdown(runner, hs, runner.getLocation(), false);
+        gatherAndCountdown(runner, hs, runner.getLocation(), false, COUNTDOWN_SECONDS);
         return true;
     }
 
@@ -643,7 +657,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
      * and the countdown runs. If moveRunner is true the runner is teleported to runnerSpot first,
      * otherwise they stay where they are.
      */
-    private void gatherAndCountdown(Player runner, List<Player> hs, Location runnerSpot, boolean moveRunner) {
+    private void gatherAndCountdown(Player runner, List<Player> hs, Location runnerSpot, boolean moveRunner, int seconds) {
         roundActive = false;
 
         if (moveRunner) {
@@ -673,9 +687,9 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         lastKnown.clear();
         remember(runner.getLocation());
 
-        Bukkit.broadcastMessage("§6§lMANHUNT §7starts in §f" + COUNTDOWN_SECONDS
+        Bukkit.broadcastMessage("§6§lMANHUNT §7starts in §f" + seconds
                 + " §7seconds. Everyone is frozen until then!");
-        startCountdown();
+        startCountdown(seconds);
     }
 
     /**
@@ -708,11 +722,21 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
     // ------------------------------------------------------------------ next round (after the runner died)
 
+    /** total time from the end of a round until the next one starts */
+    private int roundBreakTotal() {
+        return Math.max(2, getConfig().getInt("round-break-seconds", 30));
+    }
+
+    /** seconds after the end of a round until everybody gets teleported */
+    private int teleportDelay() {
+        return Math.min(Math.max(1, getConfig().getInt("teleport-delay-seconds", 5)), roundBreakTotal() - 1);
+    }
+
     private void scheduleNextRound() {
-        int secs = Math.max(1, getConfig().getInt("round-break-seconds", 30));
-        Bukkit.broadcastMessage("§6Next round starts in §f" + secs
-                + " §6seconds. A new speedrunner will be picked and the next area is loading!");
-        breakTask = Bukkit.getScheduler().runTaskLater(this, this::startNextRound, secs * 20L);
+        Bukkit.broadcastMessage("§6Next round: teleport in §f" + teleportDelay() + " §6seconds, then everybody waits "
+                + "frozen until the round starts (§f" + roundBreakTotal() + " §6seconds from now). "
+                + "A new speedrunner will be picked!");
+        breakTask = Bukkit.getScheduler().runTaskLater(this, this::startNextRound, teleportDelay() * 20L);
         preloadNextSpot();
     }
 
@@ -726,8 +750,8 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         final int cx = nextSpot.getBlockX() >> 4;
         final int cz = nextSpot.getBlockZ() >> 4;
         final List<int[]> queue = new ArrayList<>();
-        for (int dx = -3; dx <= 3; dx++) {
-            for (int dz = -3; dz <= 3; dz++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
                 queue.add(new int[]{cx + dx, cz + dz});
             }
         }
@@ -746,7 +770,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             world.addPluginChunkTicket(c[0], c[1], this); // keep it loaded until the round starts
             ticketedChunks.add(c);
             world.getChunkAt(c[0], c[1]);                 // loads / generates it
-        }, 20L, 4L);
+        }, 10L, 3L);
     }
 
     private void releasePreloadedChunks() {
@@ -831,9 +855,15 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         World world = Bukkit.getWorlds().get(0);
         Location spot = nextSpot != null ? nextSpot : randomSafeCenter(world);
         nextSpot = null;
-        gatherAndCountdown(next, hs, spot, true);
+        gatherAndCountdown(next, hs, spot, true, roundBreakTotal() - teleportDelay());
         releasePreloadedChunks(); // players are there now, so the chunks stay loaded anyway
         saveData();
+    }
+
+    private void clearInventory(Player p) {
+        p.getInventory().clear();
+        p.getInventory().setArmorContents(new ItemStack[4]);
+        p.getInventory().setItemInOffHand(new ItemStack(Material.AIR));
     }
 
     /** Fresh start for a new round: empty inventory, no advancements, full health, survival mode. */
@@ -842,9 +872,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             p.spigot().respawn();
         }
         if (getConfig().getBoolean("clear-inventory", true)) {
-            p.getInventory().clear();
-            p.getInventory().setArmorContents(new ItemStack[4]);
-            p.getInventory().setItemInOffHand(new ItemStack(Material.AIR));
+            clearInventory(p);
             p.getEnderChest().clear();
         }
         for (PotionEffect effect : new ArrayList<>(p.getActivePotionEffects())) {
@@ -926,13 +954,19 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         frozen.add(p.getUniqueId());
     }
 
-    private void startCountdown() {
-        final int[] left = {COUNTDOWN_SECONDS};
+    private void startCountdown(int seconds) {
+        final int[] left = {seconds};
         countdownTask = Bukkit.getScheduler().runTaskTimer(this, () -> {
             if (left[0] > 0) {
+                int n = left[0];
                 for (Player p : Bukkit.getOnlinePlayers()) {
-                    p.sendTitle("§e" + left[0], "§7Get ready!", 0, 25, 5);
-                    p.playSound(p.getLocation(), "block.note_block.hat", 1.0f, 1.0f);
+                    if (n <= 5) {
+                        p.sendTitle("§e" + n, "§7Get ready!", 0, 25, 5);
+                        p.playSound(p.getLocation(), "block.note_block.hat", 1.0f, 1.0f);
+                    } else if (frozen.contains(p.getUniqueId())) {
+                        p.spigot().sendMessage(ChatMessageType.ACTION_BAR, TextComponent.fromLegacyText(
+                                "§6Manhunt starts in §f" + n + " §6seconds - stay where you are!"));
+                    }
                 }
                 left[0]--;
             } else {
