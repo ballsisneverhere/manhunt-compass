@@ -107,6 +107,8 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     /** the dragon was killed (runner won): it comes back when the first player enters the End next round */
     private boolean dragonRespawnPending = false;
     private boolean endResetScheduled = false;
+    /** /manhunt resetend was used while nobody was in the End: do the full manual reset on the next visit */
+    private boolean endResetManualRequested = false;
 
     /** somebody was in the End during this round, so crystals may have been broken */
     private boolean endVisited = false;
@@ -522,14 +524,14 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                     sender.sendMessage("§cThis server has no End world.");
                     return true;
                 }
+                dragonRespawnPending = true;
+                endResetManualRequested = true;
                 if (end.getPlayers().isEmpty()) {
-                    dragonRespawnPending = true;
                     saveData();
-                    sender.sendMessage("§aThe End will reset as soon as the next player enters it during a round.");
+                    sender.sendMessage("§aNobody is in the End right now, so it will reset 3 seconds after the next player enters it.");
                 } else {
                     sender.sendMessage("§aResetting the End...");
-                    dragonRespawnPending = true;
-                    resetEnd(end, true);
+                    resetEnd(end, true, sender);
                 }
                 return true;
             }
@@ -1280,7 +1282,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             Location spot = new Location(end, base.getX() + 0.5, base.getY() + 1.0, base.getZ() + 0.5);
             boolean hasCrystal = false;
             for (Entity en : end.getNearbyEntities(spot, 2.0, 2.0, 2.0)) {
-                if (en instanceof EnderCrystal) {
+                if (en instanceof EnderCrystal && en.isValid()) {
                     hasCrystal = true;
                     break;
                 }
@@ -1310,23 +1312,45 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
      *  - dragon still alive (e.g. the runner died after breaking crystals): remove it and its crystals,
      *    put a crystal on every pillar again and spawn a fresh dragon.
      */
-    private void resetEnd(World end, boolean manual) {
-        if (!dragonRespawnPending) return;
+    private void say(CommandSender to, String message) {
+        if (to != null) {
+            to.sendMessage(message);
+        }
+    }
+
+    private void resetEnd(World end, boolean manual, CommandSender feedback) {
+        if (!dragonRespawnPending) {
+            say(feedback, "§eNo End reset is pending.");
+            return;
+        }
         dragonRespawnPending = false;
+        boolean byHand = manual || endResetManualRequested;
+        endResetManualRequested = false;
         saveData();
+
+        // 1) dragon was killed: the game's own respawn brings back the dragon AND the pillar crystals
         try {
             DragonBattle battle = end.getEnderDragonBattle();
             if (battle != null && battle.initiateRespawn(new ArrayList<>())) {
                 Bukkit.broadcastMessage("§5§lThe Ender Dragon is coming back!");
+                say(feedback, "§aThe dragon respawn started.");
                 return;
             }
-            if (!manual) {
-                // never spawn extra dragons on our own
-                Bukkit.broadcastMessage("§5The Ender Dragon could not be respawned automatically. "
-                        + "Place 4 end crystals on the exit portal, or an admin can use /manhunt resetend.");
-                return;
-            }
+        } catch (Throwable t) {
+            // e.g. older server version without this method: fall through to the manual reset
+            getLogger().warning("The game's own dragon respawn did not work: " + t);
+        }
 
+        if (!byHand) {
+            // never spawn extra dragons on our own
+            Bukkit.broadcastMessage("§5The Ender Dragon could not be respawned automatically. "
+                    + "Place 4 end crystals on the exit portal, or an admin can use /manhunt resetend.");
+            return;
+        }
+
+        // 2) dragon still alive (or the game's respawn is not available): rebuild everything by hand
+        try {
+            end.getChunkAt(0, 0);
             for (EnderDragon d : end.getEntitiesByClass(EnderDragon.class)) {
                 d.remove();
             }
@@ -1343,8 +1367,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             dragon.setPhase(EnderDragon.Phase.CIRCLING);
 
             Bukkit.broadcastMessage("§5§lThe End was reset: " + crystals + " crystals and a fresh Ender Dragon are back!");
+            say(feedback, "§aDone. " + crystals + " crystal(s) placed and a new dragon spawned.");
         } catch (Throwable t) {
             getLogger().warning("Could not reset the End: " + t);
+            say(feedback, "§cCould not reset the End: " + t);
         }
     }
 
@@ -1432,14 +1458,15 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         if (roundActive && e.getPlayer().getWorld().getEnvironment() == World.Environment.THE_END) {
             endVisited = true;
         }
-        if (!dragonRespawnPending || !roundActive) return;
+        if (!dragonRespawnPending) return;
+        if (!roundActive && !endResetManualRequested) return;
         World world = e.getPlayer().getWorld();
         if (world.getEnvironment() != World.Environment.THE_END) return;
         if (endResetScheduled) return;
         endResetScheduled = true;
         Bukkit.getScheduler().runTaskLater(this, () -> {
             endResetScheduled = false;
-            resetEnd(world, false);
+            resetEnd(world, false, null);
         }, 60L);
     }
 
