@@ -24,6 +24,7 @@ import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.EnderCrystal;
 import org.bukkit.entity.EnderDragon;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -103,8 +104,15 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     private final Set<String> netherPortalBlocks = new HashSet<>();
     /** end portal frames that got an eye from a player */
     private final Set<String> eyeFrames = new HashSet<>();
-    /** the End (dragon + pillar crystals) gets reset when the first player enters it during a round */
-    private boolean dragonRespawnPending = true;
+    /** the dragon was killed (runner won): it comes back when the first player enters the End next round */
+    private boolean dragonRespawnPending = false;
+    private boolean endResetScheduled = false;
+
+    /** somebody was in the End during this round, so crystals may have been broken */
+    private boolean endVisited = false;
+
+    /** where the current round started (new hunters respawn here instead of the world spawn) */
+    private Location roundSpawn;
     private static final BlockFace[] FACES = {
             BlockFace.UP, BlockFace.DOWN, BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST};
 
@@ -164,6 +172,12 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         y.set("portals.nether", new ArrayList<>(netherPortalBlocks));
         y.set("portals.frames", new ArrayList<>(eyeFrames));
         y.set("dragonPending", dragonRespawnPending);
+        if (roundSpawn != null && roundSpawn.getWorld() != null) {
+            y.set("roundSpawn.world", roundSpawn.getWorld().getUID().toString());
+            y.set("roundSpawn.x", roundSpawn.getX());
+            y.set("roundSpawn.y", roundSpawn.getY());
+            y.set("roundSpawn.z", roundSpawn.getZ());
+        }
         for (Map.Entry<UUID, Location> en : lastKnown.entrySet()) {
             Location l = en.getValue();
             String base = "lastKnown." + en.getKey();
@@ -208,6 +222,18 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         netherPortalBlocks.addAll(y.getStringList("portals.nether"));
         eyeFrames.addAll(y.getStringList("portals.frames"));
         dragonRespawnPending = y.getBoolean("dragonPending", false);
+        String spawnWorld = y.getString("roundSpawn.world");
+        if (spawnWorld != null) {
+            try {
+                World sw = Bukkit.getWorld(UUID.fromString(spawnWorld));
+                if (sw != null) {
+                    roundSpawn = new Location(sw, y.getDouble("roundSpawn.x"),
+                            y.getDouble("roundSpawn.y"), y.getDouble("roundSpawn.z"));
+                }
+            } catch (IllegalArgumentException ignored) {
+                // skip bad entry
+            }
+        }
 
         ConfigurationSection sec = y.getConfigurationSection("lastKnown");
         if (sec != null) {
@@ -502,7 +528,8 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                     sender.sendMessage("§aThe End will reset as soon as the next player enters it during a round.");
                 } else {
                     sender.sendMessage("§aResetting the End...");
-                    resetEnd(end);
+                    dragonRespawnPending = true;
+                    resetEnd(end, true);
                 }
                 return true;
             }
@@ -686,6 +713,9 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
         lastKnown.clear();
         remember(runner.getLocation());
+
+        roundSpawn = runnerSpot.clone();
+        saveData();
 
         Bukkit.broadcastMessage("§6§lMANHUNT §7starts in §f" + seconds
                 + " §7seconds. Everyone is frozen until then!");
@@ -1040,6 +1070,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             breakTask = null;
         }
         nextSpot = null;
+        roundSpawn = null;
         releasePreloadedChunks();
         if (countdownTask != null) {
             countdownTask.cancel();
@@ -1104,8 +1135,14 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             p.playSound(p.getLocation(), sound, 1.0f, 1.0f);
         }
 
-        // the End may be messed up (broken crystals, hurt or dead dragon): reset it on the next visit
-        dragonRespawnPending = true;
+        if (runnerWon) {
+            // the dragon is dead: bring it (and the pillar crystals) back when someone enters the End again
+            dragonRespawnPending = true;
+        } else if (endVisited) {
+            // the runner died after somebody was in the End: put back any crystals that got broken
+            restoreEndCrystalsSoon();
+        }
+        endVisited = false;
         // short break, then a new round with a new runner
         saveData();
         scheduleNextRound();
@@ -1181,6 +1218,86 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                 + frames + " end portal frame(s) closed.";
     }
 
+    private World findEnd() {
+        for (World w : Bukkit.getWorlds()) {
+            if (w.getEnvironment() == World.Environment.THE_END) {
+                return w;
+            }
+        }
+        return null;
+    }
+
+    /** Loads the pillar chunks, waits 2 seconds so existing crystals are known, then restores missing ones. */
+    private void restoreEndCrystalsSoon() {
+        final World end = findEnd();
+        if (end == null) return;
+
+        final List<int[]> chunks = new ArrayList<>();
+        for (int j = 0; j < 10; j++) {
+            int[] xz = pillarXZ(j);
+            chunks.add(new int[]{xz[0] >> 4, xz[1] >> 4});
+        }
+        for (int[] c : chunks) {
+            end.addPluginChunkTicket(c[0], c[1], this);
+            end.getChunkAt(c[0], c[1]);
+        }
+
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            try {
+                int restored = restoreCrystals(end);
+                if (restored > 0) {
+                    Bukkit.broadcastMessage("§5" + restored + " broken end crystal(s) were put back on the pillars.");
+                }
+            } catch (Throwable t) {
+                getLogger().warning("Could not restore end crystals: " + t);
+            } finally {
+                for (int[] c : chunks) {
+                    end.removePluginChunkTicket(c[0], c[1], this);
+                }
+            }
+        }, 40L);
+    }
+
+    /** Puts an end crystal on every pillar that has none (looks for the bedrock block on top of each pillar). */
+    private int restoreCrystals(World end) {
+        int restored = 0;
+        int[][] offsets = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        for (int j = 0; j < 10; j++) {
+            int[] xz = pillarXZ(j);
+            Block base = null;
+            search:
+            for (int[] off : offsets) {
+                for (int y = 125; y >= 60; y--) {
+                    Block b = end.getBlockAt(xz[0] + off[0], y, xz[1] + off[1]);
+                    if (b.getType() == Material.BEDROCK) {
+                        base = b;
+                        break search;
+                    }
+                }
+            }
+            if (base == null) continue;
+
+            Location spot = new Location(end, base.getX() + 0.5, base.getY() + 1.0, base.getZ() + 0.5);
+            boolean hasCrystal = false;
+            for (Entity en : end.getNearbyEntities(spot, 2.0, 2.0, 2.0)) {
+                if (en instanceof EnderCrystal) {
+                    hasCrystal = true;
+                    break;
+                }
+            }
+            if (hasCrystal) continue;
+
+            Block above = base.getRelative(BlockFace.UP);
+            if (above.getType() == Material.FIRE) {
+                above.setType(Material.AIR, false);
+            }
+            EnderCrystal crystal = end.spawn(spot, EnderCrystal.class);
+            crystal.setShowingBottom(false);
+            restored++;
+        }
+        return restored;
+    }
+
     /** Pillar spots of the End island (10 pillars on a circle of radius 42, same maths as the game). */
     private static int[] pillarXZ(int j) {
         double angle = 2.0 * (-Math.PI + (Math.PI / 10.0) * j);
@@ -1193,13 +1310,20 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
      *  - dragon still alive (e.g. the runner died after breaking crystals): remove it and its crystals,
      *    put a crystal on every pillar again and spawn a fresh dragon.
      */
-    private void resetEnd(World end) {
+    private void resetEnd(World end, boolean manual) {
+        if (!dragonRespawnPending) return;
         dragonRespawnPending = false;
         saveData();
         try {
             DragonBattle battle = end.getEnderDragonBattle();
             if (battle != null && battle.initiateRespawn(new ArrayList<>())) {
                 Bukkit.broadcastMessage("§5§lThe Ender Dragon is coming back!");
+                return;
+            }
+            if (!manual) {
+                // never spawn extra dragons on our own
+                Bukkit.broadcastMessage("§5The Ender Dragon could not be respawned automatically. "
+                        + "Place 4 end crystals on the exit portal, or an admin can use /manhunt resetend.");
                 return;
             }
 
@@ -1213,32 +1337,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                 }
             }
 
-            int crystals = 0;
-            int[][] offsets = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
-            for (int j = 0; j < 10; j++) {
-                int[] xz = pillarXZ(j);
-                Block base = null;
-                search:
-                for (int[] off : offsets) {
-                    for (int y = 125; y >= 60; y--) {
-                        Block b = end.getBlockAt(xz[0] + off[0], y, xz[1] + off[1]);
-                        if (b.getType() == Material.BEDROCK) {
-                            base = b;
-                            break search;
-                        }
-                    }
-                }
-                if (base == null) continue;
-
-                Block above = base.getRelative(BlockFace.UP);
-                if (above.getType() == Material.FIRE) {
-                    above.setType(Material.AIR, false);
-                }
-                EnderCrystal crystal = end.spawn(
-                        new Location(end, base.getX() + 0.5, base.getY() + 1.0, base.getZ() + 0.5), EnderCrystal.class);
-                crystal.setShowingBottom(false);
-                crystals++;
-            }
+            int crystals = restoreCrystals(end);
 
             EnderDragon dragon = end.spawn(new Location(end, 0.5, 128.0, 0.5), EnderDragon.class);
             dragon.setPhase(EnderDragon.Phase.CIRCLING);
@@ -1327,13 +1426,21 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         }
     }
 
-    /** First player in the End during a round triggers the End reset (dragon + crystals) if one is due. */
+    /** After a dragon win: the first player entering the End in the next round brings the dragon back. */
     @EventHandler
     public void onEnterEnd(PlayerChangedWorldEvent e) {
+        if (roundActive && e.getPlayer().getWorld().getEnvironment() == World.Environment.THE_END) {
+            endVisited = true;
+        }
         if (!dragonRespawnPending || !roundActive) return;
         World world = e.getPlayer().getWorld();
         if (world.getEnvironment() != World.Environment.THE_END) return;
-        Bukkit.getScheduler().runTaskLater(this, () -> resetEnd(world), 60L);
+        if (endResetScheduled) return;
+        endResetScheduled = true;
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            endResetScheduled = false;
+            resetEnd(world, false);
+        }, 60L);
     }
 
     /** Frozen players can look around but not move. */
@@ -1380,6 +1487,13 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     public void onRespawn(PlayerRespawnEvent e) {
         Player p = e.getPlayer();
         if (!hunters.contains(p.getUniqueId())) return;
+
+        // respawn where this round started, not at the far-away world spawn
+        if (roundSpawn != null && roundSpawn.getWorld() != null) {
+            Location safe = standableNear(roundSpawn, roundSpawn.getX(), roundSpawn.getZ());
+            e.setRespawnLocation(safe != null ? safe : roundSpawn.clone());
+        }
+
         Bukkit.getScheduler().runTaskLater(this, () -> {
             giveCompass(p);
             refresh(p, getRunner(), false);
