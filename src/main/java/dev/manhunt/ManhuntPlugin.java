@@ -77,7 +77,7 @@ import java.util.concurrent.ThreadLocalRandom;
 public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExecutor {
 
     /** shown in the console on start and by /manhunt version, to check the right jar is installed */
-    private static final String BUILD = "end-real-1";
+    private static final String BUILD = "end-real-2";
 
     private NamespacedKey trackerKey;
 
@@ -900,6 +900,13 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
         // same world/seed, but a random place
         World world = Bukkit.getWorlds().get(0);
+
+        // every new round starts in the morning
+        long morning = getConfig().getLong("round-start-time", 1000L);
+        if (morning >= 0) {
+            world.setTime(morning);
+        }
+
         Location spot = nextSpot != null ? nextSpot : randomSafeCenter(world);
         nextSpot = null;
         gatherAndCountdown(next, hs, spot, true, freezeSeconds());
