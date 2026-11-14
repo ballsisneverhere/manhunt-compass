@@ -76,6 +76,9 @@ import java.util.concurrent.ThreadLocalRandom;
  */
 public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExecutor {
 
+    /** shown in the console on start and by /manhunt version, to check the right jar is installed */
+    private static final String BUILD = "end-debug-1";
+
     private NamespacedKey trackerKey;
 
     private final Set<UUID> hunters = new HashSet<>();
@@ -146,7 +149,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
         long interval = Math.max(1L, getConfig().getLong("update-interval-ticks", 10L));
         Bukkit.getScheduler().runTaskTimer(this, this::tick, 1L, interval);
-        getLogger().info("ManhuntCompass enabled. Use /speedrunner <player> and /hunter <player>.");
+        getLogger().info("ManhuntCompass (build " + BUILD + ") enabled. Use /speedrunner <player> and /hunter <player>.");
     }
 
     @Override
@@ -510,6 +513,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
                 sender.sendMessage("§6Round: §f" + (roundActive ? "running"
                         : breakTask != null ? "break (next round soon)" : "not started"));
                 sender.sendMessage("§6Score: §aRunner wins " + runnerWins + " §7| §cHunter wins " + hunterWins);
+                return true;
+            }
+            case "version": {
+                sender.sendMessage("§6ManhuntCompass build: §f" + BUILD);
                 return true;
             }
             case "resetend": {
@@ -1042,7 +1049,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         if (cmd.getName().equalsIgnoreCase("manhunt")) {
             if (args.length == 1) {
                 String start = args[0].toLowerCase();
-                for (String sub : new String[]{"start", "random", "remove", "stats", "resetportals", "resetend", "status", "reset", "compass"}) {
+                for (String sub : new String[]{"start", "random", "remove", "stats", "resetportals", "resetend", "version", "status", "reset", "compass"}) {
                     if (sub.startsWith(start)) out.add(sub);
                 }
             } else if (args.length == 2 && args[0].equalsIgnoreCase("stats")) {
@@ -1318,6 +1325,22 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         }
     }
 
+    /** Step-by-step info: to whoever ran the command (if any) and always to the console. */
+    private void report(CommandSender to, String message) {
+        getLogger().info("[End reset] " + message.replaceAll("§.", ""));
+        say(to, "§7[End reset] §f" + message);
+    }
+
+    private int countDragons(World end) {
+        int n = 0;
+        for (EnderDragon d : end.getEntitiesByClass(EnderDragon.class)) {
+            if (d.isValid()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
     private void resetEnd(World end, boolean manual, CommandSender feedback) {
         if (!dragonRespawnPending) {
             say(feedback, "§eNo End reset is pending.");
@@ -1329,16 +1352,31 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         saveData();
 
         // 1) dragon was killed: the game's own respawn brings back the dragon AND the pillar crystals
+        boolean started = false;
         try {
             DragonBattle battle = end.getEnderDragonBattle();
-            if (battle != null && battle.initiateRespawn(new ArrayList<>())) {
-                Bukkit.broadcastMessage("§5§lThe Ender Dragon is coming back!");
-                say(feedback, "§aThe dragon respawn started.");
-                return;
+            report(feedback, "Dragon battle: " + (battle == null ? "not found" : "found"));
+            if (battle != null) {
+                started = battle.initiateRespawn(new ArrayList<>());
+                report(feedback, started
+                        ? "Game respawn started (takes about 30 seconds: pillars light up, then the dragon appears)."
+                        : "Game respawn not possible right now (the dragon is not dead).");
             }
         } catch (Throwable t) {
-            // e.g. older server version without this method: fall through to the manual reset
-            getLogger().warning("The game's own dragon respawn did not work: " + t);
+            report(feedback, "Game respawn failed: " + t);
+        }
+
+        if (started) {
+            Bukkit.broadcastMessage("§5§lThe Ender Dragon is coming back!");
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                int n = countDragons(end);
+                report(feedback, "Check after 45 seconds: " + n + " dragon(s) in the End.");
+                if (n == 0 && byHand) {
+                    report(feedback, "No dragon showed up, spawning one by hand.");
+                    rebuildEndByHand(end, feedback);
+                }
+            }, 900L);
+            return;
         }
 
         if (!byHand) {
@@ -1349,29 +1387,51 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         }
 
         // 2) dragon still alive (or the game's respawn is not available): rebuild everything by hand
+        rebuildEndByHand(end, feedback);
+    }
+
+    private void rebuildEndByHand(World end, CommandSender feedback) {
         try {
             end.getChunkAt(0, 0);
+
+            int removedDragons = 0;
             for (EnderDragon d : end.getEntitiesByClass(EnderDragon.class)) {
                 d.remove();
+                removedDragons++;
             }
+            int removedCrystals = 0;
             for (EnderCrystal c : end.getEntitiesByClass(EnderCrystal.class)) {
                 Location l = c.getLocation();
                 if (Math.abs(l.getX()) < 150 && Math.abs(l.getZ()) < 150) {
                     c.remove();
+                    removedCrystals++;
                 }
             }
+            report(feedback, "Removed " + removedDragons + " dragon(s) and " + removedCrystals + " crystal(s).");
 
             int crystals = restoreCrystals(end);
+            report(feedback, "Crystals placed on the pillars: " + crystals);
 
             EnderDragon dragon = end.spawn(new Location(end, 0.5, 128.0, 0.5), EnderDragon.class);
             dragon.setPhase(EnderDragon.Phase.CIRCLING);
+            report(feedback, "Dragon spawned: " + (dragon.isValid() ? "yes" : "no (entity is not valid)"));
 
             Bukkit.broadcastMessage("§5§lThe End was reset: " + crystals + " crystals and a fresh Ender Dragon are back!");
-            say(feedback, "§aDone. " + crystals + " crystal(s) placed and a new dragon spawned.");
         } catch (Throwable t) {
             getLogger().warning("Could not reset the End: " + t);
-            say(feedback, "§cCould not reset the End: " + t);
+            report(feedback, "§cBy-hand reset failed: " + t);
         }
+
+        // check again in 3 seconds; if there is still no dragon, use the server's own summon command
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            int n = countDragons(end);
+            report(feedback, "Check: " + n + " dragon(s) in the End.");
+            if (n == 0) {
+                report(feedback, "Still no dragon, trying the server's summon command.");
+                Bukkit.dispatchCommand(Bukkit.getConsoleSender(),
+                        "execute in minecraft:the_end run summon minecraft:ender_dragon 0 128 0");
+            }
+        }, 60L);
     }
 
     // ------------------------------------------------------------------ events
