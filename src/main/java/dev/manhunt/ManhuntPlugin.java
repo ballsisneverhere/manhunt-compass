@@ -77,7 +77,7 @@ import java.util.concurrent.ThreadLocalRandom;
 public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExecutor {
 
     /** shown in the console on start and by /manhunt version, to check the right jar is installed */
-    private static final String BUILD = "end-debug-1";
+    private static final String BUILD = "end-real-1";
 
     private NamespacedKey trackerKey;
 
@@ -115,6 +115,9 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
     /** somebody was in the End during this round, so crystals may have been broken */
     private boolean endVisited = false;
+
+    /** true while the plugin itself kills the old dragon, so that death does not count as a runner win */
+    private boolean ignoreDragonDeath = false;
 
     /** where the current round started (new hunters respawn here instead of the world spawn) */
     private Location roundSpawn;
@@ -1341,6 +1344,11 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         return n;
     }
 
+    /**
+     * Resets the dragon the real way: the dragon has to be dead, then 4 end crystals go on the
+     * exit portal (one on each side) and the game runs its normal respawn: beams, pillars
+     * exploding, new crystals on every pillar, new dragon.
+     */
     private void resetEnd(World end, boolean manual, CommandSender feedback) {
         if (!dragonRespawnPending) {
             say(feedback, "§eNo End reset is pending.");
@@ -1351,22 +1359,66 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         endResetManualRequested = false;
         saveData();
 
-        // 1) dragon was killed: the game's own respawn brings back the dragon AND the pillar crystals
+        boolean dragonAlive = !end.getEntitiesByClass(EnderDragon.class).isEmpty();
+        if (dragonAlive && !byHand) {
+            report(feedback, "A dragon is already alive in the End, nothing to do.");
+            return;
+        }
+        if (dragonAlive) {
+            // like in a normal game: beat the dragon first, then respawn it with the 4 crystals
+            killDragonThen(end, feedback, () -> tryRealRespawn(end, feedback, 5, true));
+        } else {
+            tryRealRespawn(end, feedback, byHand ? 5 : 2, byHand);
+        }
+    }
+
+    /** Kills the living dragon (its normal death animation) and runs "then" once it is gone. */
+    private void killDragonThen(World end, CommandSender feedback, Runnable then) {
+        ignoreDragonDeath = true;
+        for (EnderDragon d : end.getEntitiesByClass(EnderDragon.class)) {
+            d.setHealth(0.0);
+        }
+        report(feedback, "Killing the current dragon first (takes about 10 seconds)...");
+
+        final int[] seconds = {0};
+        final BukkitTask[] holder = new BukkitTask[1];
+        holder[0] = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            seconds[0]++;
+            if (end.getEntitiesByClass(EnderDragon.class).isEmpty() || seconds[0] >= 30) {
+                holder[0].cancel();
+                ignoreDragonDeath = false;
+                then.run();
+            }
+        }, 20L, 20L);
+    }
+
+    /** Puts 4 crystals on the exit portal and starts the game's respawn. Retries a few times if the dragon is still dying. */
+    private void tryRealRespawn(World end, CommandSender feedback, int attemptsLeft, boolean byHand) {
+        List<EnderCrystal> crystals = new ArrayList<>();
         boolean started = false;
         try {
             DragonBattle battle = end.getEnderDragonBattle();
-            report(feedback, "Dragon battle: " + (battle == null ? "not found" : "found"));
-            if (battle != null) {
-                started = battle.initiateRespawn(new ArrayList<>());
-                report(feedback, started
-                        ? "Game respawn started (takes about 30 seconds: pillars light up, then the dragon appears)."
-                        : "Game respawn not possible right now (the dragon is not dead).");
+            Location portal = battle == null ? null : battle.getEndPortalLocation();
+            if (battle == null) {
+                report(feedback, "Dragon battle: not found");
+            } else if (portal == null) {
+                report(feedback, "Exit portal location: not known");
+            } else {
+                end.getChunkAt(portal);
+                int[][] sides = {{2, 0}, {-2, 0}, {0, 2}, {0, -2}};
+                for (int[] side : sides) {
+                    Location at = new Location(end,
+                            portal.getBlockX() + side[0] + 0.5, portal.getBlockY() + 1.0, portal.getBlockZ() + side[1] + 0.5);
+                    crystals.add(end.spawn(at, EnderCrystal.class));
+                }
+                started = battle.initiateRespawn(crystals);
             }
         } catch (Throwable t) {
-            report(feedback, "Game respawn failed: " + t);
+            report(feedback, "Respawn attempt failed: " + t);
         }
 
         if (started) {
+            report(feedback, "Respawn started: 4 crystals are on the exit portal. Wait about 30 seconds.");
             Bukkit.broadcastMessage("§5§lThe Ender Dragon is coming back!");
             Bukkit.getScheduler().runTaskLater(this, () -> {
                 int n = countDragons(end);
@@ -1379,15 +1431,21 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             return;
         }
 
-        if (!byHand) {
-            // never spawn extra dragons on our own
-            Bukkit.broadcastMessage("§5The Ender Dragon could not be respawned automatically. "
-                    + "Place 4 end crystals on the exit portal, or an admin can use /manhunt resetend.");
+        for (EnderCrystal c : crystals) {
+            c.remove(); // the game did not accept them, take them away again
+        }
+        if (attemptsLeft > 0) {
+            Bukkit.getScheduler().runTaskLater(this,
+                    () -> tryRealRespawn(end, feedback, attemptsLeft - 1, byHand), 20L);
             return;
         }
-
-        // 2) dragon still alive (or the game's respawn is not available): rebuild everything by hand
-        rebuildEndByHand(end, feedback);
+        report(feedback, "The game would not start the respawn.");
+        if (byHand) {
+            rebuildEndByHand(end, feedback);
+        } else {
+            Bukkit.broadcastMessage("§5The Ender Dragon could not be respawned automatically. "
+                    + "Place 4 end crystals on the exit portal, or an admin can use /manhunt resetend.");
+        }
     }
 
     private void rebuildEndByHand(World end, CommandSender feedback) {
@@ -1557,6 +1615,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     @EventHandler
     public void onEntityDeath(EntityDeathEvent e) {
         if (e.getEntityType() != EntityType.ENDER_DRAGON) return;
+        if (ignoreDragonDeath) return;
         if (!roundActive || runnerId == null) return;
         Bukkit.getScheduler().runTask(this, () ->
                 endRound(true, "§f" + runnerName + " §7defeated the Ender Dragon!"));
