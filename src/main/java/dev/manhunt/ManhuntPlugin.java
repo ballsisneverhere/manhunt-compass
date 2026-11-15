@@ -9,6 +9,7 @@ import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Tag;
 import org.bukkit.World;
+import org.bukkit.WorldBorder;
 import org.bukkit.advancement.Advancement;
 import org.bukkit.advancement.AdvancementProgress;
 import org.bukkit.block.Block;
@@ -78,7 +79,7 @@ import java.util.concurrent.ThreadLocalRandom;
 public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExecutor {
 
     /** shown in the console on start and by /manhunt version, to check the right jar is installed */
-    private static final String BUILD = "no-respawn-freeze-1";
+    private static final String BUILD = "far-random-tp-1";
 
     private NamespacedKey trackerKey;
 
@@ -132,6 +133,9 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
     private static final int COUNTDOWN_SECONDS = 5;
     private static final double CIRCLE_RADIUS = 5.0;
+
+    /** how far from the world spawn the next round can start (in blocks), the world border still limits it */
+    private static final int RANDOM_TP_RADIUS = 27_000_000;
 
     // ------------------------------------------------------------------ lifecycle
 
@@ -960,12 +964,21 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
 
     /** Random dry-land spot in the same world (can't change the seed, so we go somewhere new instead). */
     private Location randomSafeCenter(World world) {
-        int radius = Math.max(100, getConfig().getInt("random-tp-radius", 3000));
+        int radius = RANDOM_TP_RADIUS;
         Location spawn = world.getSpawnLocation();
         ThreadLocalRandom rnd = ThreadLocalRandom.current();
+
+        // never pick a spot outside the world border (the vanilla maximum is about 29,999,984 blocks)
+        WorldBorder border = world.getWorldBorder();
+        double half = Math.max(16.0, border.getSize() / 2.0 - 32.0);
+        int minX = (int) Math.floor(border.getCenter().getX() - half);
+        int maxX = (int) Math.floor(border.getCenter().getX() + half);
+        int minZ = (int) Math.floor(border.getCenter().getZ() - half);
+        int maxZ = (int) Math.floor(border.getCenter().getZ() + half);
+
         for (int i = 0; i < 12; i++) {
-            int x = spawn.getBlockX() + rnd.nextInt(-radius, radius + 1);
-            int z = spawn.getBlockZ() + rnd.nextInt(-radius, radius + 1);
+            int x = Math.max(minX, Math.min(maxX, spawn.getBlockX() + rnd.nextInt(-radius, radius + 1)));
+            int z = Math.max(minZ, Math.min(maxZ, spawn.getBlockZ() + rnd.nextInt(-radius, radius + 1)));
             Block top = world.getHighestBlockAt(x, z);
             if (isSafeGround(top)) {
                 return new Location(world, x + 0.5, top.getY() + 1, z + 0.5);
