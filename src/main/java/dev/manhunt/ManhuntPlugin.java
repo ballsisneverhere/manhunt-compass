@@ -31,6 +31,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
+import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
@@ -77,7 +78,7 @@ import java.util.concurrent.ThreadLocalRandom;
 public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExecutor {
 
     /** shown in the console on start and by /manhunt version, to check the right jar is installed */
-    private static final String BUILD = "end-real-2";
+    private static final String BUILD = "no-respawn-freeze-1";
 
     private NamespacedKey trackerKey;
 
@@ -92,7 +93,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     /** world UID -> last known runner location in that world */
     private final Map<UUID, Location> lastKnown = new HashMap<>();
 
-    /** players who can't move during the start countdown */
+    /** players who can't move or break blocks during the start countdown */
     private final Set<UUID> frozen = new HashSet<>();
     private BukkitTask countdownTask;
     private BukkitTask breakTask;
@@ -980,22 +981,6 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         return t.isSolid() || t == Material.SNOW;
     }
 
-    /** Hunter respawn break: frozen for a few seconds after dying. */
-    private void startRespawnBreak(Player p) {
-        int secs = Math.max(1, getConfig().getInt("break-seconds", 10));
-        UUID id = p.getUniqueId();
-        frozen.add(id);
-        p.sendTitle("§cRespawn break", "§7You can move in " + secs + " seconds", 5, 40, 10);
-        Bukkit.getScheduler().runTaskLater(this, () -> {
-            if (frozen.remove(id)) {
-                Player q = Bukkit.getPlayer(id);
-                if (q != null) {
-                    q.sendTitle("§aGo!", "§7Find the speedrunner!", 0, 30, 10);
-                }
-            }
-        }, secs * 20L);
-    }
-
     private static Location groundAt(World world, double x, double z) {
         int y = world.getHighestBlockYAt((int) Math.floor(x), (int) Math.floor(z)) + 1;
         return new Location(world, x, y, z);
@@ -1323,12 +1308,6 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         return new int[]{(int) Math.floor(42.0 * Math.cos(angle)), (int) Math.floor(42.0 * Math.sin(angle))};
     }
 
-    /**
-     * Resets the Ender Dragon fight:
-     *  - dragon was killed: vanilla respawn (new dragon + all pillar crystals come back)
-     *  - dragon still alive (e.g. the runner died after breaking crystals): remove it and its crystals,
-     *    put a crystal on every pillar again and spawn a fresh dragon.
-     */
     private void say(CommandSender to, String message) {
         if (to != null) {
             to.sendMessage(message);
@@ -1618,6 +1597,16 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         }
     }
 
+    /** No breaking blocks during the start countdown; it works again once the round begins. */
+    @EventHandler(ignoreCancelled = true)
+    public void onBlockBreak(BlockBreakEvent e) {
+        if (frozen.isEmpty()) return;
+        if (frozen.contains(e.getPlayer().getUniqueId())) {
+            e.setCancelled(true);
+            e.getPlayer().sendMessage("§cYou can't break blocks until the manhunt starts!");
+        }
+    }
+
     /** Ender Dragon dies while a round is running = speedrunner wins. */
     @EventHandler
     public void onEntityDeath(EntityDeathEvent e) {
@@ -1650,9 +1639,6 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         Bukkit.getScheduler().runTaskLater(this, () -> {
             giveCompass(p);
             refresh(p, getRunner(), false);
-            if (roundActive) {
-                startRespawnBreak(p);
-            }
         }, 1L);
     }
 
