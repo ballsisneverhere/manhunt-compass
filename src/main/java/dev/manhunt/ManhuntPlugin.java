@@ -79,7 +79,7 @@ import java.util.concurrent.ThreadLocalRandom;
 public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExecutor {
 
     /** shown in the console on start and by /manhunt version, to check the right jar is installed */
-    private static final String BUILD = "far-random-tp-1";
+    private static final String BUILD = "head-start-1";
 
     private NamespacedKey trackerKey;
 
@@ -97,6 +97,7 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     /** players who can't move or break blocks during the start countdown */
     private final Set<UUID> frozen = new HashSet<>();
     private BukkitTask countdownTask;
+    private BukkitTask headStartTask;
     private BukkitTask breakTask;
 
     /** random spot for the next round, picked at the start of the break so its chunks can be loaded early */
@@ -132,6 +133,8 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
     private File dataFile;
 
     private static final int COUNTDOWN_SECONDS = 5;
+    /** seconds the speedrunner can move before the hunters are released */
+    private static final int HEAD_START_SECONDS = 3;
     private static final double CIRCLE_RADIUS = 5.0;
 
     /** how far from the world spawn the next round can start (in blocks), the world border still limits it */
@@ -703,6 +706,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
      */
     private void gatherAndCountdown(Player runner, List<Player> hs, Location runnerSpot, boolean moveRunner, int seconds) {
         roundActive = false;
+        if (headStartTask != null) {
+            headStartTask.cancel();
+            headStartTask = null;
+        }
 
         if (moveRunner) {
             teleportFrozen(runner, runnerSpot);
@@ -1033,21 +1040,46 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
             countdownTask.cancel();
             countdownTask = null;
         }
-        frozen.clear();
-
         if (runnerId == null) {
+            frozen.clear();
             Bukkit.broadcastMessage("§cManhunt cancelled - there is no speedrunner.");
             return;
         }
 
+        // the runner is free right away, the hunters stay frozen for the head start
+        frozen.remove(runnerId);
+
         roundActive = true;
         roundStart = System.currentTimeMillis();
         for (Player p : Bukkit.getOnlinePlayers()) {
-            p.sendTitle("§a§lGO!", "§7The manhunt has started!", 0, 30, 10);
-            p.playSound(p.getLocation(), "entity.player.levelup", 1.0f, 1.0f);
+            if (p.getUniqueId().equals(runnerId)) {
+                p.sendTitle("§a§lGO!", "§7You have a " + HEAD_START_SECONDS + " second head start!", 0, 30, 10);
+                p.playSound(p.getLocation(), "entity.player.levelup", 1.0f, 1.0f);
+            } else if (frozen.contains(p.getUniqueId())) {
+                p.sendTitle("§c§lWait!", "§7" + runnerName + " has a " + HEAD_START_SECONDS + " second head start", 0, 40, 10);
+            } else {
+                p.sendTitle("§a§lGO!", "§7The manhunt has started!", 0, 30, 10);
+            }
         }
-        Bukkit.broadcastMessage("§6§lMANHUNT STARTED §7- Speedrunner: §f" + runnerName);
+        Bukkit.broadcastMessage("§6§lMANHUNT STARTED §7- Speedrunner: §f" + runnerName
+                + " §7(" + HEAD_START_SECONDS + " second head start)");
         saveData();
+
+        if (headStartTask != null) {
+            headStartTask.cancel();
+        }
+        headStartTask = Bukkit.getScheduler().runTaskLater(this, () -> {
+            headStartTask = null;
+            List<UUID> released = new ArrayList<>(frozen);
+            frozen.clear();
+            for (UUID id : released) {
+                Player h = Bukkit.getPlayer(id);
+                if (h != null) {
+                    h.sendTitle("§a§lGO!", "§7Hunt them down!", 0, 30, 10);
+                    h.playSound(h.getLocation(), "entity.player.levelup", 1.0f, 1.0f);
+                }
+            }
+        }, HEAD_START_SECONDS * 20L);
     }
 
     @Override
@@ -1092,6 +1124,10 @@ public final class ManhuntPlugin extends JavaPlugin implements Listener, TabExec
         if (countdownTask != null) {
             countdownTask.cancel();
             countdownTask = null;
+        }
+        if (headStartTask != null) {
+            headStartTask.cancel();
+            headStartTask = null;
         }
         frozen.clear();
         hunters.clear();
